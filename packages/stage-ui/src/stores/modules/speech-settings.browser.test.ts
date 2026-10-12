@@ -1,9 +1,13 @@
+import type { Pinia } from 'pinia'
 import type { Component } from 'vue'
+
+import type { KokoroAdapter } from '../../libs/inference/adapters/kokoro'
+import type { Voices } from '../../workers/kokoro/types'
 
 import en from '@proj-airi/i18n/locales/en'
 
 import { MotionPlugin } from '@vueuse/motion'
-import { createPinia, disposePinia } from 'pinia'
+import { createPinia, disposePinia, getActivePinia } from 'pinia'
 import { createSyncedPiniaPlugin } from 'pinia-plugin-synced'
 import { afterEach, expect, it, vi } from 'vitest'
 import { createApp, h } from 'vue'
@@ -11,6 +15,7 @@ import { createI18n } from 'vue-i18n'
 import { createMemoryHistory, createRouter } from 'vue-router'
 
 import SpeechSettings from '../../../../stage-pages/src/pages/settings/modules/speech.vue'
+import KokoroSettings from '../../../../stage-pages/src/pages/settings/providers/speech/kokoro-local.vue'
 
 import { injectKeyPiniaSynced } from '../../libs/pinia/synced-context'
 import { captureAnalyticsEvent, enableAnalyticsCapture, isAnalyticsAvailableInBuild } from '../../libs/product-signals/client'
@@ -21,6 +26,52 @@ import { useSpeechStore } from './speech'
 // Analytics delivery is external IO. Exercise the real page and stores while
 // recording its outgoing payload instead of sending product events.
 vi.mock('../../libs/product-signals/client', { spy: true })
+
+const kokoroVoices: Voices = { af_heart: { name: 'Heart', language: 'en-us', gender: 'Female' } }
+
+// Each Electron renderer owns one Kokoro adapter singleton, but test renderers
+// share this module scope. Key the fake runtime by the Pinia that is active when
+// `getKokoroAdapter()` runs. Pinia sets it when an action starts, so tests must
+// not run Kokoro work in two renderers at once.
+const kokoroRuntimes = new Map<Pinia, KokoroAdapter>()
+
+function createKokoroRuntime(): KokoroAdapter {
+  let loaded = false
+  return {
+    loadModel: vi.fn(async () => {
+      loaded = true
+      return kokoroVoices
+    }),
+    generate: vi.fn(async () => {
+      if (!loaded)
+        throw new Error('Model not loaded. Call loadModel() first.')
+      return new ArrayBuffer(8)
+    }),
+    getVoices: () => {
+      if (!loaded)
+        throw new Error('Model not loaded. Call loadModel() first.')
+      return kokoroVoices
+    },
+    terminate: vi.fn(),
+    get state() { return loaded ? 'ready' : 'idle' },
+    get manifest() { return loaded ? { quantization: 'fp32', device: 'wasm' } : null },
+    deviceLossCount: 0,
+  }
+}
+
+vi.mock('../../libs/inference/adapters/kokoro', () => ({
+  getKokoroAdapter: async () => {
+    const pinia = getActivePinia()
+    if (!pinia)
+      throw new Error('Kokoro adapter requested outside a renderer')
+    let runtime = kokoroRuntimes.get(pinia)
+    if (!runtime) {
+      runtime = createKokoroRuntime()
+      kokoroRuntimes.set(pinia, runtime)
+    }
+    return runtime
+  },
+}))
 
 const cleanups: Array<() => void> = []
 
@@ -56,6 +107,7 @@ function mountRenderer(namespace: string, page?: Component) {
 afterEach(() => {
   for (const cleanup of cleanups.splice(0))
     cleanup()
+  kokoroRuntimes.clear()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
   localStorage.clear()
@@ -170,4 +222,61 @@ it('shows a manual model transport failure in the settings page', async () => {
   expect(globalErrors).not.toHaveBeenCalled()
   expect(follower.container.textContent).toContain('Model selection transport unavailable')
   expect(leader.speech.activeSpeechModel).toBe('tts-1')
+})
+
+// https://github.com/moeru-ai/airi/issues/2942
+it('issue #2942: plays a Kokoro test voice from the settings renderer after the stage renderer loads the model', async () => {
+  localStorage.clear()
+  vi.stubGlobal('fetch', vi.fn<typeof fetch>(async () => Response.json({ voices: [], models: [] })))
+  const namespace = `speech-settings:${crypto.randomUUID()}`
+  const leader = mountRenderer(namespace)
+  await vi.waitFor(() => expect(leader.runtime.isLeader()).toBe(true))
+  const provider = 'kokoro-local'
+  const config = { model: 'fp32', voiceId: '' }
+  await useProviderConfigStore(leader.pinia).ensureProvider(provider, provider, config)
+  await useProviderStore(leader.pinia).forceProviderConfigured(provider)
+  // The stage renderer preloads the configured Kokoro model at startup.
+  await useProviderStore(leader.pinia).loadProviderModel(provider, config)
+  expect(kokoroRuntimes.get(leader.pinia)?.state).toBe('ready')
+  await leader.speech.selectProviderModel(provider, 'fp32', 'af_heart')
+
+  const follower = mountRenderer(namespace, SpeechSettings)
+  await vi.waitFor(() => expect(follower.speech.activeSpeechVoice?.id).toBe('af_heart'))
+  const testVoice = Array.from(follower.container.querySelectorAll('button'))
+    .find(button => button.textContent?.trim() === 'Test Voice')
+  expect(testVoice).toBeDefined()
+  await vi.waitFor(() => expect(testVoice!.disabled).toBe(false))
+  testVoice!.click()
+
+  const notLoaded = 'Model not loaded. Call loadModel() first.'
+  await vi.waitFor(() => expect(follower.container.querySelector('audio') !== null || follower.container.textContent?.includes(notLoaded)).toBe(true))
+  expect(follower.container.textContent).not.toContain(notLoaded)
+  expect(follower.container.querySelector('audio')).not.toBeNull()
+})
+
+// https://github.com/moeru-ai/airi/issues/2942
+it('issue #2942: plays the Kokoro playground voice from the settings renderer', async () => {
+  localStorage.clear()
+  vi.stubGlobal('fetch', vi.fn<typeof fetch>(async () => Response.json({ voices: [], models: [] })))
+  const namespace = `speech-settings:${crypto.randomUUID()}`
+  const leader = mountRenderer(namespace)
+  await vi.waitFor(() => expect(leader.runtime.isLeader()).toBe(true))
+  const provider = 'kokoro-local'
+  await useProviderConfigStore(leader.pinia).ensureProvider(provider, provider, { model: 'fp32', voiceId: '' })
+  await useProviderStore(leader.pinia).forceProviderConfigured(provider)
+
+  // The page loads the model with the synced `loadProviderModel` when it mounts.
+  const follower = mountRenderer(namespace, KokoroSettings)
+  await vi.waitFor(() => expect(kokoroRuntimes.get(leader.pinia)?.state).toBe('ready'))
+  const testVoice = () => Array.from(follower.container.querySelectorAll('button'))
+    .find(button => button.textContent?.trim() === 'Test Voice')
+  await vi.waitFor(() => expect(testVoice()?.disabled).toBe(false))
+  testVoice()!.click()
+
+  const notLoaded = 'Model not loaded. Call loadModel() first.'
+  await vi.waitFor(() => expect(follower.container.querySelector('audio') !== null || follower.container.textContent?.includes(notLoaded)).toBe(true))
+  expect(follower.container.textContent).not.toContain(notLoaded)
+  expect(follower.container.querySelector('audio')).not.toBeNull()
+  expect(kokoroRuntimes.get(leader.pinia)?.generate).toHaveBeenCalledWith('Hello! This is a test of the Kokoro text-to-speech system.', 'af_heart')
+  expect(kokoroRuntimes.has(follower.pinia)).toBe(false)
 })
