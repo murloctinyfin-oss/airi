@@ -1,6 +1,4 @@
 <script setup lang="ts">
-import type { SpeechProvider } from '@xsai-ext/providers/utils'
-
 import { getCachedWebGPUCapabilities } from '@proj-airi/stage-shared/webgpu'
 import {
   SpeechPlayground,
@@ -75,26 +73,11 @@ const modelOptions = computed(() => {
 // Generate speech with Kokoro-specific parameters
 async function handleGenerateSpeech(input: string, voiceId: string, _useSSML: boolean) {
   try {
-    const provider = await providersStore.getProviderInstance(providerId) as SpeechProvider
-    if (!provider) {
-      console.error('[Kokoro Playground] Failed to get provider instance')
-      throw new Error('Failed to initialize speech provider')
-    }
-
     const config = providerStore.getProviderConfig(providerId)
     const selectedModel = config.model as string | undefined || defaultModel
 
-    const result = await speechStore.speech(
-      provider,
-      selectedModel,
-      input,
-      voiceId,
-      {
-        ...config,
-      },
-    )
-
-    return result
+    // The store sends a Kokoro preview to the leader, so clone nested reactive values.
+    return await speechStore.generatePreviewSpeech(providerId, selectedModel, input, voiceId, cloneDeep(config))
   }
   catch (error) {
     console.error('[Kokoro Playground] Error generating speech:', error)

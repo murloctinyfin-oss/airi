@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import type { VoiceType } from '@proj-airi/stage-ui/composables'
-import type { SpeechProviderWithExtraOptions } from '@xsai-ext/providers/utils'
 
 import { errorMessageFrom } from '@moeru/std'
 import {
@@ -25,7 +24,7 @@ import {
   Skeleton,
   Textarea,
 } from '@proj-airi/ui'
-import { generateSpeech } from '@xsai/generate-speech'
+import { cloneDeep } from 'es-toolkit'
 import { storeToRefs } from 'pinia'
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -405,12 +404,6 @@ async function generateTestSpeech() {
   if (useSSML.value && !ssmlText.value.trim())
     return
 
-  const provider = await providersStore.getProviderInstance(activeSpeechProvider.value) as SpeechProviderWithExtraOptions<string, any>
-  if (!provider) {
-    console.error('Failed to initialize speech provider')
-    return
-  }
-
   const providerConfig = providerStore.getProviderConfig(activeSpeechProvider.value)
 
   // For OpenAI Compatible providers, fall back to provider config for model and voice
@@ -484,14 +477,14 @@ async function generateTestSpeech() {
       })
     }
 
-    const response = await generateSpeech({
-      ...provider.speech(
-        model,
-        withManualPreviewAnalytics(speechRequest.providerConfig, previewProvider, previewAnalytics.voice_type),
-      ),
-      input: speechRequest.input,
-      voice: voice.id,
-    })
+    // The store can send these arguments to the leader, so clone nested reactive values.
+    const response = await speechStore.generatePreviewSpeech(
+      activeSpeechProvider.value,
+      model,
+      speechRequest.input,
+      voice.id,
+      cloneDeep(withManualPreviewAnalytics(speechRequest.providerConfig, previewProvider, previewAnalytics.voice_type)),
+    )
 
     // Convert the response to a blob and create an object URL
     audioUrl.value = URL.createObjectURL(new Blob([response]))

@@ -541,6 +541,56 @@ export const useSpeechStore = defineStore('speech', () => {
     return response
   }
 
+  async function generateWithProviderInstance(
+    providerId: string,
+    model: string,
+    input: string,
+    voice: string,
+    providerConfig: Record<string, unknown>,
+  ): Promise<ArrayBuffer> {
+    const provider = await providersStore.getProviderInstance<SpeechProviderWithExtraOptions<string, Record<string, unknown>>>(providerId)
+    return generateSpeech({ ...provider.speech(model, providerConfig), input, voice })
+  }
+
+  /**
+   * Generates speech in the leader when cross-window sync is active.
+   *
+   * Callers use {@link generatePreviewSpeech}. Each call keeps its audio in the
+   * replicated operation history, so only work that needs the leader's runtime uses it.
+   */
+  async function generateSpeechInLeader(
+    providerId: string,
+    model: string,
+    input: string,
+    voice: string,
+    providerConfig: Record<string, unknown> = {},
+  ): Promise<ArrayBuffer> {
+    return generateWithProviderInstance(providerId, model, input, voice, providerConfig)
+  }
+
+  /**
+   * Generates a manual preview, such as Test Voice in a settings page.
+   *
+   * The synced `loadProviderModel` loads a local model only in the leader, so a
+   * provider with `loadModel`, such as Kokoro, generates there. Other providers
+   * keep no runtime state and generate in the calling renderer. Unlike
+   * {@link speech}, this takes a provider ID, and the caller adds analytics to
+   * `providerConfig`.
+   */
+  async function generatePreviewSpeech(
+    providerId: string,
+    model: string,
+    input: string,
+    voice: string,
+    providerConfig: Record<string, unknown> = {},
+  ): Promise<ArrayBuffer> {
+    if (providersStore.findProviderDefinition(providerId)?.extraMethods?.loadModel) {
+      // The store action routes the run to the leader. A call to the local function would run in this window.
+      return useSpeechStore().generateSpeechInLeader(providerId, model, input, voice, providerConfig)
+    }
+    return generateWithProviderInstance(providerId, model, input, voice, providerConfig)
+  }
+
   /** Captures one response's provider, voice, model, and settings before any asynchronous work. */
   function createOutput(turn: TurnRef, selection: AiriExtension['modules']['speech'], output: Pick<SpeechOutput, 'playback' | 'onPlaybackStart' | 'onPlaybackEnd' | 'onSpecial'>, audioContext: AudioContext): SpeechOutput {
     const providerId = selection.provider
@@ -736,6 +786,8 @@ export const useSpeechStore = defineStore('speech', () => {
 
     // Actions
     speech,
+    generateSpeechInLeader,
+    generatePreviewSpeech,
     loadVoicesForProvider,
     loadVoiceCatalog,
     invalidateVoiceCatalogs,
@@ -752,7 +804,7 @@ export const useSpeechStore = defineStore('speech', () => {
   }
 }, {
   synced: {
-    actions: ['loadVoiceCatalog', 'invalidateVoiceCatalogs', 'selectProviderModel', 'ensureActiveSpeechVoice', 'resetSettings'],
+    actions: ['loadVoiceCatalog', 'invalidateVoiceCatalogs', 'selectProviderModel', 'ensureActiveSpeechVoice', 'resetSettings', 'generateSpeechInLeader'],
     state: true,
   },
 })

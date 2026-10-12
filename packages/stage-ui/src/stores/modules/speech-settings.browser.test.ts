@@ -19,6 +19,7 @@ import KokoroSettings from '../../../../stage-pages/src/pages/settings/providers
 
 import { injectKeyPiniaSynced } from '../../libs/pinia/synced-context'
 import { captureAnalyticsEvent, enableAnalyticsCapture, isAnalyticsAvailableInBuild } from '../../libs/product-signals/client'
+import { useAuthStore } from '../auth'
 import { useProviderConfigStore } from '../providers/config'
 import { useProviderStore } from '../providers/provider'
 import { useSpeechStore } from './speech'
@@ -225,6 +226,14 @@ it('shows a manual model transport failure in the settings page', async () => {
 })
 
 // https://github.com/moeru-ai/airi/issues/2942
+// ROOT CAUSE:
+//
+// The synced `loadProviderModel` loads Kokoro only in the leader. Test Voice ran
+// in the settings renderer, whose adapter had no model:
+//
+// await generateSpeech({ ...provider.speech(model, config), input, voice })
+//
+// `generatePreviewSpeech` now sends a provider with `loadModel` to the leader.
 it('issue #2942: plays a Kokoro test voice from the settings renderer after the stage renderer loads the model', async () => {
   localStorage.clear()
   vi.stubGlobal('fetch', vi.fn<typeof fetch>(async () => Response.json({ voices: [], models: [] })))
@@ -252,6 +261,8 @@ it('issue #2942: plays a Kokoro test voice from the settings renderer after the 
   await vi.waitFor(() => expect(follower.container.querySelector('audio') !== null || follower.container.textContent?.includes(notLoaded)).toBe(true))
   expect(follower.container.textContent).not.toContain(notLoaded)
   expect(follower.container.querySelector('audio')).not.toBeNull()
+  expect(kokoroRuntimes.get(leader.pinia)?.generate).toHaveBeenCalledWith('Hello, my name is AI Assistant', 'af_heart')
+  expect(kokoroRuntimes.has(follower.pinia)).toBe(false)
 })
 
 // https://github.com/moeru-ai/airi/issues/2942
@@ -279,4 +290,44 @@ it('issue #2942: plays the Kokoro playground voice from the settings renderer', 
   expect(follower.container.querySelector('audio')).not.toBeNull()
   expect(kokoroRuntimes.get(leader.pinia)?.generate).toHaveBeenCalledWith('Hello! This is a test of the Kokoro text-to-speech system.', 'af_heart')
   expect(kokoroRuntimes.has(follower.pinia)).toBe(false)
+})
+
+it('generates an official provider test voice with preview analytics in the settings renderer', async () => {
+  localStorage.clear()
+  const fetchMock = vi.fn<typeof fetch>(async (input) => {
+    if (String(input).includes('/audio/speech'))
+      return new Response(new ArrayBuffer(8))
+    return Response.json({ voices: [{ id: 'voice', name: 'Voice', languages: [] }], models: [{ id: 'model-a', name: 'Model A' }], default: 'model-a' })
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  const namespace = `speech-settings:${crypto.randomUUID()}`
+  const leader = mountRenderer(namespace)
+  await vi.waitFor(() => expect(leader.runtime.isLeader()).toBe(true))
+  const now = new Date()
+  useAuthStore(leader.pinia).$patch({
+    token: 'access-token',
+    user: { id: 'owner', name: 'Owner', email: 'owner@example.com', emailVerified: true, createdAt: now, updatedAt: now },
+    session: { id: 'session', userId: 'owner', token: 'session-token', createdAt: now, updatedAt: now, expiresAt: new Date(now.getTime() + 60000) },
+  })
+  const provider = 'official-provider-speech'
+  await useProviderConfigStore(leader.pinia).ensureProvider(provider, provider, {})
+  await useProviderStore(leader.pinia).forceProviderConfigured(provider)
+  await leader.speech.selectProviderModel(provider, 'model-a', 'voice')
+  const leaderActions: string[] = []
+  leader.speech.$onAction(({ name }) => leaderActions.push(name))
+
+  const follower = mountRenderer(namespace, SpeechSettings)
+  await vi.waitFor(() => expect(follower.speech.activeSpeechVoice?.id).toBe('voice'))
+  const testVoice = Array.from(follower.container.querySelectorAll('button'))
+    .find(button => button.textContent?.trim() === 'Test Voice')
+  expect(testVoice).toBeDefined()
+  await vi.waitFor(() => expect(testVoice!.disabled).toBe(false))
+  testVoice!.click()
+
+  await vi.waitFor(() => expect(follower.container.querySelector('audio')).not.toBeNull())
+  const speechRequest = fetchMock.mock.calls.find(([input]) => String(input).includes('/audio/speech'))
+  expect(speechRequest).toBeDefined()
+  // The server reads preview analytics from `extra_body.airi_analytics`.
+  expect(JSON.parse(String(speechRequest![1]?.body))).toMatchObject({ extra_body: { airi_analytics: { trigger: 'manual', source: 'manual_preview' } } })
+  expect(leaderActions).not.toContain('generateSpeechInLeader')
 })
